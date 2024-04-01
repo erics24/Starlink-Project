@@ -1,11 +1,7 @@
 # Reference: https://github.com/Ben-Kempton/SILLEO-SCNS/blob/master/source/constellation.py
 
-# Qifei: https://github.com/abx13/Hypatia seems closer to what we want to achieve.
-#        They also use Python for setting up satellite topology, but their work is more
-#        complicated with packet-level simulations using ns-3.
-#        Currently I'm writing code based on the SILLEO-SCNS one.
-
 import numpy as np
+from scipy.spatial.distance import pdist, squareform
 from PyAstronomy import pyasl
 
 """
@@ -20,44 +16,55 @@ EARTH_ROTATION_PER_SECONDS = 360. / SECONDS_PER_DAY
 """
 Configurable Parameters
 """
-GROUND_STATION_DEFAULT_ALTITUDE = 100
-MAX_ISL_DISTANCE = 5000 * 1000
-MAX_STG_DISTANCE = 1000 * 1000
+GATEWAY_DEFAULT_ELEVATION = 25
+MAX_ISL_DISTANCE = 3000 * 1000
+MAX_STG_DISTANCE = 1800 * 1000
 
-# TODO: Make numpy arrays of satellite/gnd coordinates for faster distance computation?
+CONSTELLATION_LIST = []
+PLANE_LIST = []
 SATELLITE_LIST = []
-GROUND_STATION_LIST = []
+GATEWAY_LIST = []
+NODE_POSITION_MATRIX = None
+ISL_LINK_MATRIX = None
+STG_LINK_MATRIX = None
+AREA_CONNECTIVITY_DICT = None
 
 
 class Constellation:
-    constellation_id = 0
+    cons_id = 0
 
     def __init__(self,
                  num_planes=1,
                  num_nodes_per_plane=4,
                  inclination=45.,
-                 altitude=1000 * 1000):
-        self.id = Constellation.constellation_id
-        Constellation.constellation_id += 1
+                 altitude=1000 * 1000,
+                 plane_offset_shift=0.):
+        self.id = Constellation.cons_id
+        Constellation.cons_id += 1
         self.num_nodes_per_plane = num_nodes_per_plane
         self.total_nodes = num_planes * num_nodes_per_plane
         self.semi_major_axis = EARTH_RADIUS + altitude
         self.inclination = inclination
 
         self.planes = []
+        plane_node_init_time_offsets = gen_node_init_time_offset(n_planes=num_planes,
+                                                                 n_nodes_per_plane=num_nodes_per_plane)
         for plane_i in range(num_planes):
-            plane_offset = 360. / num_planes * plane_i
-            self.planes.append(Plane(constellation=self, plane_offset=plane_offset))
-        self.add_inter_plane_links()
-
-    def add_inter_plane_links(self):
-        pass
+            # Shift the right ascension of each plane by a bit so planes from different constellations
+            # won't intersect at the equator
+            plane_offset = 360. / num_planes * plane_i + plane_offset_shift
+            # Shift the initial position (time offset) of each satellite on the plane by a bit so
+            # the first satellite from different planes won't all start from the equator
+            node_init_time_offset = plane_node_init_time_offsets[plane_i]
+            self.planes.append(Plane(constellation=self, plane_offset=plane_offset,
+                                     node_init_time_offset=node_init_time_offset))
+        CONSTELLATION_LIST.append(self)
 
 
 class Plane:
     plane_id = 0
 
-    def __init__(self, constellation, plane_offset=0.):
+    def __init__(self, constellation, plane_offset=0., node_init_time_offset=0.):
         self.id = Plane.plane_id
         Plane.plane_id += 1
         self.constellation = constellation
@@ -73,57 +80,35 @@ class Plane:
                                                 i=self.inclination)
         self.satellites = []
         for node_i in range(num_nodes):
-            time_offset = self.period / num_nodes * node_i
-            # TODO: Shift the starting offset of each plane by a bit so they won't all start from the equator?
+            # Shift the initial position (time offset) of each satellite on the plane by a bit so
+            # the first satellite from different planes won't all start from the equator
+            time_offset = self.period * (node_i / num_nodes + node_init_time_offset)
             self.satellites.append(Satellite(plane=self, time_offset=time_offset))
-        self.add_intra_plane_links()
-
-    def add_intra_plane_links(self):
-        pass
+        PLANE_LIST.append(self)
 
 
 class Satellite:
-    satellite_id = 0
+    sat_id = 0
 
     def __init__(self, plane, time_offset=0.):
-        self.id = Satellite.satellite_id
-        Satellite.satellite_id += 1
+        self.id = Satellite.sat_id
+        Satellite.sat_id += 1
         self.plane = plane
         self.init_time_offset = time_offset
-        pos = plane.plane_solver.xyzPos(time_offset)
-        self.pos = np.array(pos, dtype=np.float32)  # (x, y, z)
-        # Fixed links
-        self.intra_plane_links = []  # Adjacency list
-        self.inter_plane_links = []
-        # Dynamic links
-        # We search for the nearest satellite only in the next plane id
-        # from each constellation
-        # when trying to find the next intra constellation link
-        # during the simulation
-        self.inter_constellation_links = []
-        self.satellite_to_gnd_links = []
-
+        self.init_area = None
+        self.area = None
         SATELLITE_LIST.append(self)
 
 
-class GroundStation:
-    gnd_id = -1  # use negative integers for ground station IDs
+class Gateway:
+    gate_id = 0
 
-    def __init__(self, latitude, longitude, altitude=GROUND_STATION_DEFAULT_ALTITUDE):
-        self.id = GroundStation.gnd_id
-        GroundStation.gnd_id -= 1
+    def __init__(self, latitude, longitude, altitude=GATEWAY_DEFAULT_ELEVATION):
+        self.id = Gateway.gate_id
+        Gateway.gate_id += 1
         self.init_pos = lat_lon_to_cartesian(latitude, longitude, altitude)
-        self.pos = self.init_pos.copy()
-        # Fixed links
-        self.gnd_to_gnd_links = []
-        # Dynamic links
-        self.gnd_to_satellite_links = []
-
-        GROUND_STATION_LIST.append(self)
-
-
-def add_gnd_to_gnd_links():
-    pass
+        self.area = None
+        GATEWAY_LIST.append(self)
 
 
 def lat_lon_to_cartesian(latitude, longitude, altitude):
@@ -140,16 +125,34 @@ def calculate_orbit_period(semi_major_axis):
     return 2. * np.pi * np.sqrt(np.power(float(semi_major_axis), 3) / STD_GRAVITATIONAL_PARAMETER_EARTH)
 
 
+def gen_node_init_time_offset(n_planes, n_nodes_per_plane):
+    phase_offset_inc = 1. / n_nodes_per_plane / n_planes
+    phase_offsets = []
+    toggle = False
+    # Put offsets in this order [...8,6,4,2,0,1,3,5,7,9...]
+    # so that offsets in adjacent planes are close to each other
+    for i in range(n_planes):
+        if toggle:
+            phase_offsets.append(phase_offset_inc * i)
+        else:
+            phase_offsets.insert(0, phase_offset_inc * i)
+        toggle = not toggle
+    return phase_offsets
+
+
 def update_pos(cur_time=0.):
+    global NODE_POSITION_MATRIX
+    if NODE_POSITION_MATRIX is None:
+        NODE_POSITION_MATRIX = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST), 3), dtype=np.float32)
     # Update all satellite positions
     for satellite in SATELLITE_LIST:
         satellite_pos = satellite.plane.plane_solver.xyzPos(satellite.init_time_offset + cur_time)
-        satellite.pos = np.array(satellite_pos, dtype=np.float32)
-    # Update all ground station positions
+        NODE_POSITION_MATRIX[satellite.id, :] = satellite_pos
+    # Update all gateway positions
     rotation_degree = EARTH_ROTATION_PER_SECONDS * np.fmod(cur_time, SECONDS_PER_DAY)
     rotation_matrix = get_rotation_matrix(rotation_degree)
-    for gnd in GROUND_STATION_LIST:
-        gnd.pos = np.dot(rotation_matrix, gnd.init_pos)
+    for gate in GATEWAY_LIST:
+        NODE_POSITION_MATRIX[gate.id + len(SATELLITE_LIST), :] = np.dot(rotation_matrix, gate.init_pos)
 
 
 def get_rotation_matrix(degree):
@@ -165,8 +168,110 @@ def get_rotation_matrix(degree):
                      [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
 
 
-def update_links(cur_time=0.):
-    # TODO: Check existing inter-constellation/satellite-to-gnd links
-    # TODO: Search for new available links
-    #       TODO: Implement 3D Nearest Neighbor Search
+def initialize_area():
     pass
+
+
+def update_links():
+    global ISL_LINK_MATRIX
+    if ISL_LINK_MATRIX is None:
+        ISL_LINK_MATRIX = np.full((len(SATELLITE_LIST), len(SATELLITE_LIST)), np.inf, dtype=np.float32)
+    global STG_LINK_MATRIX
+    if STG_LINK_MATRIX is None:
+        STG_LINK_MATRIX = np.full((len(SATELLITE_LIST), len(GATEWAY_LIST)), np.inf, dtype=np.float32)
+    new_links = squareform(pdist(NODE_POSITION_MATRIX).astype(np.float32))
+
+    link_broken = []
+    link_established = []
+    # Filter links within reachable distances
+    new_isl_links = new_links[:len(SATELLITE_LIST), :len(SATELLITE_LIST)]
+    new_isl_links[new_isl_links > MAX_ISL_DISTANCE] = np.inf
+    new_isl_links[new_isl_links == 0] = np.inf
+    new_stg_links = new_links[:len(SATELLITE_LIST), len(SATELLITE_LIST):]
+    new_stg_links[new_stg_links > MAX_STG_DISTANCE] = np.inf
+    new_stg_links[new_stg_links == 0] = np.inf
+    for sat in SATELLITE_LIST:
+        # Always and only allow links between adjacent satellites on the same plane
+        plane_sat_start_id = sat.plane.satellites[0].id
+        plane_sat_ind = sat.id - plane_sat_start_id
+        plane_sat_cnt = sat.plane.constellation.num_nodes_per_plane
+        sat_isl_link = np.full((plane_sat_cnt,), np.inf)
+        sat_isl_link[(plane_sat_ind - 1) % plane_sat_cnt] = 1
+        sat_isl_link[(plane_sat_ind + 1) % plane_sat_cnt] = 1
+        new_isl_links[sat.id, plane_sat_start_id:plane_sat_start_id + plane_sat_cnt] = (
+                new_isl_links[sat.id, plane_sat_start_id:plane_sat_start_id + plane_sat_cnt] * sat_isl_link)
+        # Allow up to one link (or temporarily two) between a satellite and another on adjacent planes
+        # (use existing nearest or pick new nearest)
+        cons_plane_start_id = sat.plane.constellation.planes[0].id
+        cons_plane_ind = sat.plane.id - cons_plane_start_id
+        cons_plane_cnt = len(sat.plane.constellation.planes)
+        adj_planes = (PLANE_LIST[(cons_plane_ind - 1) % cons_plane_cnt + cons_plane_start_id],
+                      PLANE_LIST[(cons_plane_ind + 1) % cons_plane_cnt + cons_plane_start_id])
+        for adj_plane in adj_planes:
+            adj_plane_sat_start_id = adj_plane.satellites[0].id
+            existing_sat_id = np.argmin(ISL_LINK_MATRIX[
+                                        sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt])
+            if (ISL_LINK_MATRIX[sat.id, adj_plane_sat_start_id + existing_sat_id] == np.inf or
+                    new_isl_links[sat.id, adj_plane_sat_start_id + existing_sat_id] == np.inf):
+                # Find new nearest satellite on the adjacent plane if not existed or broken
+                nearest_sat_id = np.argmin(new_isl_links[
+                                           sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt])
+                if new_isl_links[sat.id, adj_plane_sat_start_id + nearest_sat_id] != np.inf:
+                    adj_plane_sat_isl_link = np.full((plane_sat_cnt,), np.inf)
+                    adj_plane_sat_isl_link[nearest_sat_id] = 1
+                    new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] = (
+                            new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] *
+                            adj_plane_sat_isl_link)
+            else:
+                # Use existing nearest satellite link
+                adj_plane_sat_isl_link = np.full((plane_sat_cnt,), np.inf)
+                adj_plane_sat_isl_link[existing_sat_id] = 1
+                new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] = (
+                        new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] *
+                        adj_plane_sat_isl_link)
+        # Allow up to one link (or temporarily two) between a satellite and another on a different constellation
+        # (use existing nearest or pick new nearest)
+        for other_cons in CONSTELLATION_LIST:
+            if other_cons.id != sat.plane.constellation.id:
+                cons_sat_start_id = other_cons.planes[0].satellites[0].id
+                cons_sat_end_id = other_cons.planes[-1].satellites[-1].id
+                existing_sat_id = np.argmin(ISL_LINK_MATRIX[sat.id, cons_sat_start_id:cons_sat_end_id + 1])
+                if (ISL_LINK_MATRIX[sat.id, cons_sat_start_id + existing_sat_id] == np.inf or
+                        new_isl_links[sat.id, cons_sat_start_id + existing_sat_id] == np.inf):
+                    # Find new nearest satellite in the constellation if not existed or broken
+                    nearest_sat_id = np.argmin(new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1])
+                    if new_isl_links[sat.id, cons_sat_start_id + nearest_sat_id] != np.inf:
+                        cons_sat_isl_link = np.full((cons_sat_end_id - cons_sat_start_id + 1,), np.inf)
+                        cons_sat_isl_link[nearest_sat_id] = 1
+                        new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] = (
+                                new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] * cons_sat_isl_link)
+                else:
+                    # Use existing nearest satellite link
+                    cons_sat_isl_link = np.full((cons_sat_end_id - cons_sat_start_id + 1,), np.inf)
+                    cons_sat_isl_link[existing_sat_id] = 1
+                    new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] = (
+                            new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] * cons_sat_isl_link)
+
+        # Allow up to one link from any satellite to a gateway (use existing or pick new nearest)
+        existing_gate_id = np.argmin(STG_LINK_MATRIX[sat.id, :])
+        if STG_LINK_MATRIX[sat.id, existing_gate_id] == np.inf or new_stg_links[sat.id, existing_gate_id] == np.inf:
+            nearest_gate_id = np.argmin(new_stg_links[sat.id, :])
+            if new_stg_links[sat.id, nearest_gate_id] != np.inf:
+                sat_gate_link = np.full((len(GATEWAY_LIST),), np.inf)
+                sat_gate_link[nearest_gate_id] = 1
+                new_stg_links[sat.id, :] = new_stg_links[sat.id, :] * sat_gate_link
+        else:
+            sat_gate_link = np.full((len(GATEWAY_LIST),), np.inf)
+            sat_gate_link[existing_gate_id] = 1
+            new_stg_links[sat.id, :] = new_stg_links[sat.id, :] * sat_gate_link
+
+    # Make ISL link matrix symmetric
+    new_isl_links = np.minimum(new_isl_links, new_isl_links.T)
+
+    # Compare changes, measure change frequency
+    # Measure link count per node
+    # Update area if changed
+    # Update area level connectivity
+
+    ISL_LINK_MATRIX = new_isl_links
+    STG_LINK_MATRIX = new_stg_links
