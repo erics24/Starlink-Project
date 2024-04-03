@@ -18,7 +18,7 @@ Configurable Parameters
 """
 GATEWAY_DEFAULT_ELEVATION = 25
 MAX_ISL_DISTANCE = 3000 * 1000
-MAX_STG_DISTANCE = 1800 * 1000
+MAX_STG_DISTANCE = 1500 * 1000
 
 CONSTELLATION_LIST = []
 PLANE_LIST = []
@@ -103,10 +103,13 @@ class Satellite:
 class Gateway:
     gate_id = 0
 
-    def __init__(self, latitude, longitude, altitude=GATEWAY_DEFAULT_ELEVATION):
+    def __init__(self, latitude, longitude, altitude=GATEWAY_DEFAULT_ELEVATION, init_pos=None):
         self.id = Gateway.gate_id
         Gateway.gate_id += 1
-        self.init_pos = lat_lon_to_cartesian(latitude, longitude, altitude)
+        if init_pos is not None:
+            self.init_pos = init_pos.copy()
+        else:
+            self.init_pos = lat_lon_to_cartesian(latitude, longitude, altitude)
         self.area = None
         GATEWAY_LIST.append(self)
 
@@ -181,8 +184,6 @@ def update_links():
         STG_LINK_MATRIX = np.full((len(SATELLITE_LIST), len(GATEWAY_LIST)), np.inf, dtype=np.float32)
     new_links = squareform(pdist(NODE_POSITION_MATRIX).astype(np.float32))
 
-    link_broken = []
-    link_established = []
     # Filter links within reachable distances
     new_isl_links = new_links[:len(SATELLITE_LIST), :len(SATELLITE_LIST)]
     new_isl_links[new_isl_links > MAX_ISL_DISTANCE] = np.inf
@@ -190,17 +191,18 @@ def update_links():
     new_stg_links = new_links[:len(SATELLITE_LIST), len(SATELLITE_LIST):]
     new_stg_links[new_stg_links > MAX_STG_DISTANCE] = np.inf
     new_stg_links[new_stg_links == 0] = np.inf
+
+    isl_link_mask = np.full((len(SATELLITE_LIST), len(SATELLITE_LIST)), np.inf, dtype=np.float32)
+    stg_link_mask = np.full((len(SATELLITE_LIST), len(GATEWAY_LIST)), np.inf, dtype=np.float32)
     for sat in SATELLITE_LIST:
         # Always and only allow links between adjacent satellites on the same plane
         plane_sat_start_id = sat.plane.satellites[0].id
         plane_sat_ind = sat.id - plane_sat_start_id
         plane_sat_cnt = sat.plane.constellation.num_nodes_per_plane
-        sat_isl_link = np.full((plane_sat_cnt,), np.inf)
-        sat_isl_link[(plane_sat_ind - 1) % plane_sat_cnt] = 1
-        sat_isl_link[(plane_sat_ind + 1) % plane_sat_cnt] = 1
-        new_isl_links[sat.id, plane_sat_start_id:plane_sat_start_id + plane_sat_cnt] = (
-                new_isl_links[sat.id, plane_sat_start_id:plane_sat_start_id + plane_sat_cnt] * sat_isl_link)
-        # Allow up to one link (or temporarily two) between a satellite and another on adjacent planes
+        isl_link_mask[sat.id, plane_sat_start_id + (plane_sat_ind - 1) % plane_sat_cnt] = 1.
+        isl_link_mask[sat.id, plane_sat_start_id + (plane_sat_ind + 1) % plane_sat_cnt] = 1.
+
+        # Allow links between a satellite and another on adjacent planes
         # (use existing nearest or pick new nearest)
         cons_plane_start_id = sat.plane.constellation.planes[0].id
         cons_plane_ind = sat.plane.id - cons_plane_start_id
@@ -217,19 +219,12 @@ def update_links():
                 nearest_sat_id = np.argmin(new_isl_links[
                                            sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt])
                 if new_isl_links[sat.id, adj_plane_sat_start_id + nearest_sat_id] != np.inf:
-                    adj_plane_sat_isl_link = np.full((plane_sat_cnt,), np.inf)
-                    adj_plane_sat_isl_link[nearest_sat_id] = 1
-                    new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] = (
-                            new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] *
-                            adj_plane_sat_isl_link)
+                    isl_link_mask[sat.id, adj_plane_sat_start_id + nearest_sat_id] = 1.
             else:
                 # Use existing nearest satellite link
-                adj_plane_sat_isl_link = np.full((plane_sat_cnt,), np.inf)
-                adj_plane_sat_isl_link[existing_sat_id] = 1
-                new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] = (
-                        new_isl_links[sat.id, adj_plane_sat_start_id:adj_plane_sat_start_id + plane_sat_cnt] *
-                        adj_plane_sat_isl_link)
-        # Allow up to one link (or temporarily two) between a satellite and another on a different constellation
+                isl_link_mask[sat.id, adj_plane_sat_start_id + existing_sat_id] = 1.
+
+        # Allow links between a satellite and another on a different constellation
         # (use existing nearest or pick new nearest)
         for other_cons in CONSTELLATION_LIST:
             if other_cons.id != sat.plane.constellation.id:
@@ -241,37 +236,81 @@ def update_links():
                     # Find new nearest satellite in the constellation if not existed or broken
                     nearest_sat_id = np.argmin(new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1])
                     if new_isl_links[sat.id, cons_sat_start_id + nearest_sat_id] != np.inf:
-                        cons_sat_isl_link = np.full((cons_sat_end_id - cons_sat_start_id + 1,), np.inf)
-                        cons_sat_isl_link[nearest_sat_id] = 1
-                        new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] = (
-                                new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] * cons_sat_isl_link)
+                        isl_link_mask[sat.id, cons_sat_start_id + nearest_sat_id] = 1.
                 else:
                     # Use existing nearest satellite link
-                    cons_sat_isl_link = np.full((cons_sat_end_id - cons_sat_start_id + 1,), np.inf)
-                    cons_sat_isl_link[existing_sat_id] = 1
-                    new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] = (
-                            new_isl_links[sat.id, cons_sat_start_id:cons_sat_end_id + 1] * cons_sat_isl_link)
+                    isl_link_mask[sat.id, cons_sat_start_id + existing_sat_id] = 1.
 
-        # Allow up to one link from any satellite to a gateway (use existing or pick new nearest)
+        # Allow links from any satellite to a gateway
+        # (use existing or pick new nearest)
         existing_gate_id = np.argmin(STG_LINK_MATRIX[sat.id, :])
         if STG_LINK_MATRIX[sat.id, existing_gate_id] == np.inf or new_stg_links[sat.id, existing_gate_id] == np.inf:
             nearest_gate_id = np.argmin(new_stg_links[sat.id, :])
             if new_stg_links[sat.id, nearest_gate_id] != np.inf:
-                sat_gate_link = np.full((len(GATEWAY_LIST),), np.inf)
-                sat_gate_link[nearest_gate_id] = 1
-                new_stg_links[sat.id, :] = new_stg_links[sat.id, :] * sat_gate_link
+                stg_link_mask[sat.id, nearest_gate_id] = 1.
         else:
-            sat_gate_link = np.full((len(GATEWAY_LIST),), np.inf)
-            sat_gate_link[existing_gate_id] = 1
-            new_stg_links[sat.id, :] = new_stg_links[sat.id, :] * sat_gate_link
+            stg_link_mask[sat.id, existing_gate_id] = 1.
+
+    # Ensure that any gateway is connected to at least one satellite if possible
+    # (use existing or pick new nearest)
+    for gate in GATEWAY_LIST:
+        if np.sum(stg_link_mask[:, gate.id] != np.inf) < 1:
+            existing_sat_id = np.argmin(STG_LINK_MATRIX[:, gate.id])
+            if STG_LINK_MATRIX[existing_sat_id, gate.id] == np.inf or new_stg_links[existing_sat_id, gate.id] == np.inf:
+                nearest_sat_id = np.argmin(new_stg_links[:, gate.id])
+                if new_stg_links[nearest_sat_id, gate.id] != np.inf:
+                    stg_link_mask[nearest_sat_id, gate.id] = 1.
+            else:
+                stg_link_mask[existing_sat_id, gate.id] = 1.
+
+    new_isl_links = new_isl_links * isl_link_mask
+    new_stg_links = new_stg_links * stg_link_mask
 
     # Make ISL link matrix symmetric
+    # i.e. making temporary one-way links two-way
     new_isl_links = np.minimum(new_isl_links, new_isl_links.T)
 
-    # Compare changes, measure change frequency
-    # Measure link count per node
-    # Update area if changed
-    # Update area level connectivity
+    # Check ISL connectivity
+    sat_degree_row = np.sum(new_isl_links < np.inf, axis=1)
+    sat_degree_col = np.sum(new_isl_links < np.inf, axis=0)
+    assert np.array_equal(sat_degree_row, sat_degree_col)
+    if np.min(sat_degree_row) < 1:
+        print("Warning: At least one satellite is unreachable: #{}".format(np.argmin(sat_degree_row)))
 
+    # Check STG link connectivity
+    stg_sat_degree = np.sum(new_stg_links < np.inf, axis=1)
+    stg_gate_degree = np.sum(new_stg_links < np.inf, axis=0)
+    if np.min(stg_gate_degree) < 1:
+        print("Warning: At least one gateway is unreachable: #{}".format(np.argmin(stg_gate_degree)))
+
+    # Compare changes, measure change frequency
+    isl_link_changes = (new_isl_links < np.inf).astype(np.int8) - (ISL_LINK_MATRIX < np.inf).astype(np.int8)
+    isl_link_broken = np.nonzero(isl_link_changes == -1)
+    isl_link_established = np.nonzero(isl_link_changes == 1)
+    stg_link_changes = (new_stg_links < np.inf).astype(np.int8) - (STG_LINK_MATRIX < np.inf).astype(np.int8)
+    stg_link_broken = np.nonzero(stg_link_changes == -1)
+    stg_link_established = np.nonzero(stg_link_changes == 1)
+    print("{} ISL links broken, {} ISL links established, {} in total".format(len(isl_link_broken[0]) // 2,
+                                                                              len(isl_link_established[0]) // 2,
+                                                                              np.sum(sat_degree_row) // 2))
+    print("{} STG links broken, {} STG links established, {} in total".format(len(stg_link_broken[0]),
+                                                                              len(stg_link_established[0]),
+                                                                              np.sum(stg_gate_degree)))
     ISL_LINK_MATRIX = new_isl_links
     STG_LINK_MATRIX = new_stg_links
+
+    return isl_link_broken, isl_link_established, stg_link_broken, stg_link_established
+
+
+def update_area(isl_link_broken, isl_link_established, stg_link_broken, stg_link_established):
+    # TODO:
+    # If matrices not exist, assign dynamic satellites to areas, mark ABRs for each area,
+    # get area connectivity matrix (do not include gateway here),
+    # then assign gateways to areas based on stg links, then run OSPF within each area
+
+    # Otherwise, update area if changed
+    # Update area level connectivity, etc.
+
+    # Note: Never use a gateway as ABR when calculating routes -
+    # only compare satellite ABRs and find the closest one locally
+    pass
