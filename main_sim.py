@@ -7,17 +7,22 @@ import topology
 """
 Configurable Parameters
 """
-SIMULATION_TIME_STEP = 1  # in seconds
-SIMULATION_TIME_LENGTH = 6298  # in seconds  # a full period
 USE_SAVED_TOPOLOGY_FILE = True
 SAVE_TOPOLOGY_AFTER_FINISH = False
 TOPOLOGY_FILEPATH = "saved_topology.pkl"
 
+# Use following setup if not loading from saved topology file
 SATELLITE_ALTITUDE = 1000 * 1000
 INCLINATIONS = [30, 50, 70, -30, -50, -70]
 N_PLANES = 10
 N_NODES_PER_PLANE = 30
 GATEWAY_FILEPATH = "gateways.json"
+INITIAL_AREA_PLANE_WIDTH = 1  # 1, 2
+INITIAL_AREA_SATELLITE_CNT_PER_PLANE = 5   # 3, 5, 6, 10
+INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 0  # 1:0, 3:1, 1:1
+
+SIMULATION_TIME_STEP = 1  # in seconds
+SIMULATION_TIME_LENGTH = 10  # in seconds  # a full period = 6298
 
 
 def initialize(topology_file=None):
@@ -31,6 +36,8 @@ def initialize(topology_file=None):
         N_PLANES = saved_topology["n_planes"]
         N_NODES_PER_PLANE = saved_topology["n_nodes_per_plane"]
         GATEWAY_FILEPATH = saved_topology["gateway_filepath"]
+        topology.ISL_LINK_MATRIX = saved_topology["isl_link_matrix"]
+        topology.STG_LINK_MATRIX = saved_topology["stg_link_matrix"]
 
     # Add constellations, planes, and satellites
     for ci, incl in enumerate(INCLINATIONS):
@@ -45,13 +52,20 @@ def initialize(topology_file=None):
             topology.Gateway(latitude=gateway['lat'], longitude=gateway['lng'], altitude=gateway['minElevation'])
 
     if topology_file is None:
-        topology.initialize_area()
+        n_areas = topology.initialize_area(n_planes_per_area=INITIAL_AREA_PLANE_WIDTH,
+                                           n_nodes_per_plane_per_area=INITIAL_AREA_SATELLITE_CNT_PER_PLANE,
+                                           static_area_ratio=INITIAL_AREA_STATIC_RATIO,
+                                           dynamic_area_ratio=INITIAL_AREA_DYNAMIC_RATIO)
     else:
-        topology.ISL_LINK_MATRIX = saved_topology["isl_link_matrix"]
-        topology.STG_LINK_MATRIX = saved_topology["stg_link_matrix"]
-        # TODO: Also load area assignment and area connectivity matrix
-        # TODO: Also load predecessor_matrix and shortest_dist_matrix
-        pass
+        topology.SATELLITE_INITIAL_AREA = saved_topology["sat_init_area"]
+        topology.NODE_AREA_ASSIGNMENT = saved_topology["node_area_matrix"]
+        topology.AREA_CONNECTIVITY_MATRIX = saved_topology["area_matrix"]
+        topology.SHORTEST_AREA_PATH_DIST_MATRIX = saved_topology["spf_area_dist_matrix"]
+        topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = saved_topology["spf_area_path_matrix"]
+        topology.SHORTEST_NODE_PATH_DIST_MATRIX = saved_topology["spf_node_dist_matrix"]
+        topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = saved_topology["spf_node_path_matrix"]
+        n_areas = topology.AREA_CONNECTIVITY_MATRIX.shape[0]
+    print("# Total Areas: {}".format(n_areas))
 
 
 def run_simulation():
@@ -75,6 +89,17 @@ def run_simulation():
         # print(np.min(topology.STG_LINK_MATRIX, axis=0)[0:165])
         sim_time += SIMULATION_TIME_STEP
 
+        # TODO:
+        # Traffic patterns:
+        # one (US-East/West) gateway to all satellites (above land, i.e. close to a gateway but maybe outside of range)
+        # all satellites (above land) to nearest gateway
+        # all satellites (above land) to all satellites (above land)
+        # all satellites to all satellites
+        # Observation period = ?
+        # Metrics: distribution of latency, distribution of # hops (nodes or areas), distribution of node/area degrees
+        # area/link changing rate
+
+    # TODO:
     # Calculate average #links at stable state
     # Measure link change rate at stable state
     # Measure area change rate at stable state
@@ -87,7 +112,14 @@ def run_simulation():
                          "n_nodes_per_plane": N_NODES_PER_PLANE,
                          "gateway_filepath": GATEWAY_FILEPATH,
                          "isl_link_matrix": topology.ISL_LINK_MATRIX,
-                         "stg_link_matrix": topology.STG_LINK_MATRIX}
+                         "stg_link_matrix": topology.STG_LINK_MATRIX,
+                         "sat_init_area": topology.SATELLITE_INITIAL_AREA,
+                         "node_area_matrix": topology.NODE_AREA_ASSIGNMENT,
+                         "area_matrix": topology.AREA_CONNECTIVITY_MATRIX,
+                         "spf_area_dist_matrix": topology.SHORTEST_AREA_PATH_DIST_MATRIX,
+                         "spf_area_path_matrix": topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX,
+                         "spf_node_dist_matrix": topology.SHORTEST_NODE_PATH_DIST_MATRIX,
+                         "spf_node_path_matrix": topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX}
         with open(TOPOLOGY_FILEPATH, "wb") as topology_out_file:
             pickle.dump(topology_dict, topology_out_file)
 
