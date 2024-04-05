@@ -22,7 +22,7 @@ SAVE_TOPOLOGY_AFTER_FINISH = False
 TOPOLOGY_FILEPATH = "saved_topology_{}_{}.pkl".format(INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO)
 
 SIMULATION_TIME_STEP = 1                                      # in seconds
-SIMULATION_TIME_LENGTH = 600                                  # in seconds  # a full period = 6298
+SIMULATION_TIME_LENGTH = 60                                   # in seconds  # a full period = 6298
 
 
 def initialize(topology_file=None):
@@ -68,7 +68,7 @@ def initialize(topology_file=None):
         topology.AREA_CONNECTIVITY_MATRIX = saved_topology["area_matrix"]
         topology.SHORTEST_AREA_PATH_DIST_MATRIX = saved_topology["spf_area_dist_matrix"]
         topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = saved_topology["spf_area_path_matrix"]
-        topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = saved_topology["spf_node_path_matrix"]
+        topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA = saved_topology["spf_node_path_matrix"]
         n_areas = topology.AREA_CONNECTIVITY_MATRIX.shape[0]
     print("# Total Areas: {}".format(n_areas))
 
@@ -102,6 +102,9 @@ def run_simulation():
         # Finally, record all data, dump to files, and plot figures TODO
 
         sim_time += SIMULATION_TIME_STEP
+        if sim_time == SIMULATION_TIME_STEP:
+            # Note that this could be very slow - we only run this at stable state
+            topology.compute_all_to_all_latency()
 
     # Save links and area assignments to file
     if SAVE_TOPOLOGY_AFTER_FINISH:
@@ -117,7 +120,7 @@ def run_simulation():
                          "area_matrix": topology.AREA_CONNECTIVITY_MATRIX,
                          "spf_area_dist_matrix": topology.SHORTEST_AREA_PATH_DIST_MATRIX,
                          "spf_area_path_matrix": topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX,
-                         "spf_node_path_matrix": topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX}
+                         "spf_node_path_matrix": topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA}
         with open(TOPOLOGY_FILEPATH, "wb") as topology_out_file:
             pickle.dump(topology_dict, topology_out_file)
 

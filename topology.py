@@ -26,12 +26,14 @@ global ISL_LINK_MATRIX  # #sat by #sat, elements are distances, inf means no pat
 global STG_LINK_MATRIX  # #sat by #gate, elements are distances, inf means no paths
 
 global SATELLITE_INITIAL_AREA  # elements are area ids, -1 means no assignment
-global NODE_AREA_ASSIGNMENT  # #node by #area, 0 and 1 elements
+global NODE_AREA_ASSIGNMENT  # #node by #area, 0/1 elements
 
-global AREA_CONNECTIVITY_MATRIX  # #area by #area, 0 and 1 elements
+global AREA_CONNECTIVITY_MATRIX  # #area by #area, 0/1 elements
 global SHORTEST_AREA_PATH_DIST_MATRIX  # #area by #area, 0 means no paths
 global SHORTEST_AREA_PATH_PREDECESSOR_MATRIX  # #area by #area, area ids, -9999 means no paths
-global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX  # #area by #area, sat ids or (gate ids + #sat), -9999 means no paths
+
+# #area by #area, sat ids or (gate ids + #sat), -9999 means no paths
+SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA = []
 
 
 class Constellation:
@@ -114,7 +116,7 @@ def initialize_area(n_planes_per_area, n_nodes_per_plane_per_area, static_area_r
     assert dynamic_area_ratio >= 0
     global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
     global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
-    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA
     SATELLITE_INITIAL_AREA = np.full((len(SATELLITE_LIST)), -1, dtype=np.int32)
 
     area_id = 0
@@ -153,8 +155,7 @@ def initialize_area(n_planes_per_area, n_nodes_per_plane_per_area, static_area_r
     AREA_CONNECTIVITY_MATRIX = np.zeros((area_id, area_id), dtype=np.int32)
     SHORTEST_AREA_PATH_DIST_MATRIX = np.zeros((area_id, area_id), dtype=np.float64)
     SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = np.full((area_id, area_id), -9999, dtype=np.int32)
-    SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = np.full((len(SATELLITE_LIST) + len(GATEWAY_LIST),
-                                                     len(SATELLITE_LIST) + len(GATEWAY_LIST)), -9999, dtype=np.int32)
+    SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA = [[]] * area_id
     return area_id
 
 
@@ -305,7 +306,7 @@ def update_area(isl_link_broken, isl_link_established):
     global ISL_LINK_MATRIX, STG_LINK_MATRIX
     global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
     global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
-    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA
     new_node_area_assignment = NODE_AREA_ASSIGNMENT.copy()
 
     # Remove duplicate undirected links
@@ -445,7 +446,7 @@ def update_area(isl_link_broken, isl_link_established):
         for area_id in range(new_node_area_assignment.shape[1]):
             area_sat_list = np.nonzero(new_node_area_assignment[:len(SATELLITE_LIST), area_id] > 0)[0]
             area_isl_link_matrix = ISL_LINK_MATRIX[np.ix_(area_sat_list, area_sat_list)]
-            area_isl_link_matrix[area_isl_link_matrix == np.inf] = 0
+            area_isl_link_matrix[area_isl_link_matrix == np.inf] = 0.
             area_sat_graph = csr_matrix(area_isl_link_matrix)
             n_comp, labels = connected_components(csgraph=area_sat_graph, directed=False, return_labels=True)
             if n_comp > 1:
@@ -519,19 +520,16 @@ def update_area(isl_link_broken, isl_link_established):
     area_changed = np.unique(np.append(area_with_node_removed, area_with_node_added))
     print("{} areas have internal changes and routing table updates".format(len(area_changed)))
 
-    # Clean up the previous routing table in the updated area first
-    for area in area_changed:
-        area_sat_list_prev = np.nonzero(NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), area] > 0)[0]
-        area_gate_list_prev = np.nonzero(NODE_AREA_ASSIGNMENT[len(SATELLITE_LIST):, area] > 0)[0]
-        area_sat_gate_list_prev = np.append(area_sat_list_prev, area_gate_list_prev + len(SATELLITE_LIST))
-        SHORTEST_NODE_PATH_PREDECESSOR_MATRIX[np.ix_(area_sat_gate_list_prev, area_sat_gate_list_prev)] = -9999
-
     # Run OSPF within each updated area and update routing tables
     for area in area_changed:
         area_sat_gate_list, _, area_shortest_node_path_predecessor_matrix = (
             run_intra_area_ospf(area, new_node_area_assignment))
-        SHORTEST_NODE_PATH_PREDECESSOR_MATRIX[np.ix_(area_sat_gate_list, area_sat_gate_list)] = (
+        shortest_node_path_predecessor_matrix = np.full((len(SATELLITE_LIST) + len(GATEWAY_LIST),
+                                                         len(SATELLITE_LIST) + len(GATEWAY_LIST)),
+                                                        -9999, dtype=np.int32)
+        shortest_node_path_predecessor_matrix[np.ix_(area_sat_gate_list, area_sat_gate_list)] = (
             area_shortest_node_path_predecessor_matrix)
+        SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA[area] = shortest_node_path_predecessor_matrix
     NODE_AREA_ASSIGNMENT = new_node_area_assignment
     return area_with_node_removed, area_with_node_added
 
@@ -540,14 +538,14 @@ def run_intra_area_ospf(area, node_area_assignment):
     global ISL_LINK_MATRIX, STG_LINK_MATRIX
     global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
     global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
-    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA
 
     area_sat_list = np.nonzero(node_area_assignment[:len(SATELLITE_LIST), area] > 0)[0]
     area_gate_list = np.nonzero(node_area_assignment[len(SATELLITE_LIST):, area] > 0)[0]
     area_isl_link_matrix = ISL_LINK_MATRIX[np.ix_(area_sat_list, area_sat_list)]
     area_stg_link_matrix = STG_LINK_MATRIX[np.ix_(area_sat_list, area_gate_list)]
-    area_isl_link_matrix[area_isl_link_matrix == np.inf] = 0
-    area_stg_link_matrix[area_stg_link_matrix == np.inf] = 0
+    area_isl_link_matrix[area_isl_link_matrix == np.inf] = 0.
+    area_stg_link_matrix[area_stg_link_matrix == np.inf] = 0.
     area_node_matrix = np.bmat([[area_isl_link_matrix,
                                  area_stg_link_matrix],
                                 [area_stg_link_matrix.T,
@@ -564,34 +562,49 @@ def run_intra_area_ospf(area, node_area_assignment):
     return area_sat_gate_list, area_shortest_node_path_dist_matrix, area_shortest_node_path_predecessor_matrix
 
 
+def get_intra_area_hop_cnt(src_node, dest_node, area):
+    global ISL_LINK_MATRIX, STG_LINK_MATRIX
+    global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
+    global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA
+
+    assert NODE_AREA_ASSIGNMENT[src_node, area] == 1 and NODE_AREA_ASSIGNMENT[dest_node, area] == 1
+    hop_cnt = 0
+    predecessor_node = dest_node
+    while predecessor_node != src_node:
+        predecessor_node = SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA[area][src_node, predecessor_node]
+        hop_cnt += 1
+    return hop_cnt
+
+
+def find_nearest_abr(src_node, src_area, dest_area, dist_matrix):
+    assert AREA_CONNECTIVITY_MATRIX[src_area, dest_area] == 1
+    assert NODE_AREA_ASSIGNMENT[src_node, src_area] == 1
+    abr_candidates = np.nonzero(NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), src_area] *
+                                NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), dest_area] > 0)[0]
+    distances = dist_matrix[src_node, abr_candidates]
+    assert np.min(distances) > 0
+    return abr_candidates[np.argmin(distances)], np.min(distances)
+
+
 def compute_all_to_all_latency():
     global ISL_LINK_MATRIX, STG_LINK_MATRIX
     global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
     global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
-    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA
 
     # First of all, run OSPF within all areas and fill in the full shortest_node_path_dist_matrix
     # #node by #node, 0 means no paths
-    shortest_node_path_dist_matrix = np.zeros(SHORTEST_NODE_PATH_PREDECESSOR_MATRIX.shape, dtype=np.float64)
-    shortest_node_path_predecessor_matrix = np.zeros_like(SHORTEST_NODE_PATH_PREDECESSOR_MATRIX)
+    shortest_node_path_dist_matrix = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST),
+                                               len(SATELLITE_LIST) + len(GATEWAY_LIST)), dtype=np.float64)
     for area_id in range(NODE_AREA_ASSIGNMENT.shape[1]):
-        area_sat_gate_list, area_shortest_node_path_dist_matrix, area_shortest_node_path_predecessor_matrix = (
+        area_sat_gate_list, area_shortest_node_path_dist_matrix, _ = (
             run_intra_area_ospf(area_id, NODE_AREA_ASSIGNMENT))
-        shortest_node_path_predecessor_matrix[np.ix_(area_sat_gate_list, area_sat_gate_list)] = (
-            area_shortest_node_path_predecessor_matrix)
         shortest_node_path_dist_matrix[np.ix_(area_sat_gate_list, area_sat_gate_list)] = (
             area_shortest_node_path_dist_matrix)
-    assert np.array_equal(shortest_node_path_predecessor_matrix, SHORTEST_NODE_PATH_PREDECESSOR_MATRIX)
 
     all_to_all_latency_matrix = shortest_node_path_dist_matrix * 1000 / SPEED_OF_LIGHT  # in milliseconds
-    for area_0 in range(NODE_AREA_ASSIGNMENT.shape[1]):
-        for area_1 in range(NODE_AREA_ASSIGNMENT.shape[1]):
-            pass
-
-    # create matrix storing all latencies
-    # for each pair of src -> dest, compute route and distance (latency) and fill in the matrix
-    # also store the hop count to a matrix
-
+    all_to_all_hop_cnt_matrix = np.zeros(all_to_all_latency_matrix.shape, dtype=np.int32)
     # Cross-area routing:
     # First find the area-level path using SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
     # Note that src and dest can belong to multiple areas, so we choose the path based on minimum area distance
@@ -599,11 +612,66 @@ def compute_all_to_all_latency():
     # Then, within each area along the path, search for ABRs that connect two areas from NODE_AREA_ASSIGNMENT
     # (excluding gateway nodes), pick an ABR with the shortest path locally, then move on to the next area
     # i.e. a gateway node is never used as an internal node in a path
+    for src in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
+        print(src)
+        for dest in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
+            src_area_candidates = get_node_area(src, NODE_AREA_ASSIGNMENT)
+            dest_area_candidates = get_node_area(dest, NODE_AREA_ASSIGNMENT)
+            area_path_lengths = SHORTEST_AREA_PATH_DIST_MATRIX[np.ix_(src_area_candidates, dest_area_candidates)]
+            area_path_candidates = np.nonzero(area_path_lengths == np.min(area_path_lengths))
+            src_area = src_area_candidates[area_path_candidates[0][0]]
+            dest_area = dest_area_candidates[area_path_candidates[1][0]]
+            if src_area == dest_area:
+                # This will be an intra-area route
+                all_to_all_hop_cnt_matrix[src, dest] = get_intra_area_hop_cnt(src, dest, src_area)
+                continue
+            area_level_path = [dest_area]
+            predecessor_area = dest_area
+            while predecessor_area != src_area:
+                predecessor_area = SHORTEST_AREA_PATH_PREDECESSOR_MATRIX[src_area, predecessor_area]
+                area_level_path.insert(0, predecessor_area)
+            assert len(area_level_path) == int(np.min(area_path_lengths)) + 1
 
-    # Special baseline case: No areas, ideal route; directly run dijkstra from ISL_LINK_MATRIX (could be slow...)
-    # TODO
-    # return latency matrix, etc.
-    pass
+            cur_node = src
+            total_latency = 0.
+            total_hop_cnt = 0
+            for area_path_ind in range(len(area_level_path) - 1):
+                cur_area = area_level_path[area_path_ind]
+                next_area = area_level_path[area_path_ind + 1]
+                next_abr, latency = find_nearest_abr(cur_node, cur_area, next_area, all_to_all_latency_matrix)
+                total_latency += latency
+                total_hop_cnt += get_intra_area_hop_cnt(cur_node, next_abr, cur_area)
+                cur_node = next_abr
+            total_latency += all_to_all_latency_matrix[cur_node, dest]
+            total_hop_cnt += get_intra_area_hop_cnt(cur_node, dest, area_level_path[-1])
+            all_to_all_latency_matrix[src, dest] = total_latency
+            all_to_all_hop_cnt_matrix[src, dest] = total_hop_cnt
+
+    # Special baseline case (ideal):
+    # No area assignment, treat the entire network as a graph and compute optimal path route
+    full_link_latency_matrix = np.bmat([[ISL_LINK_MATRIX,
+                                         STG_LINK_MATRIX],
+                                        [STG_LINK_MATRIX.T,
+                                         np.zeros((len(GATEWAY_LIST), len(GATEWAY_LIST)), dtype=np.float64)]])
+    full_link_latency_matrix[full_link_latency_matrix == np.inf] = 0.
+    full_link_latency_matrix = full_link_latency_matrix * 1000 / SPEED_OF_LIGHT  # in milliseconds
+    full_link_hop_cnt_matrix = np.zeros(full_link_latency_matrix.shape, dtype=np.int32)
+    full_node_graph = csr_matrix(full_link_latency_matrix)
+    full_latency_matrix, full_node_predecessor_matrix = dijkstra(
+        csgraph=full_node_graph, directed=False, return_predecessors=True)
+    for src in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
+        for dest in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
+            hop_cnt = 0
+            predecessor = dest
+            while predecessor != src:
+                predecessor = full_node_predecessor_matrix[src, predecessor]
+                if predecessor == -9999:
+                    hop_cnt = -1
+                    break
+                hop_cnt += 1
+            full_link_hop_cnt_matrix[src, dest] = hop_cnt
+
+    return all_to_all_latency_matrix, all_to_all_hop_cnt_matrix, full_latency_matrix, full_link_hop_cnt_matrix
 
 # TODO: Def a func to get some statistics here:
 #       # node (sat/gate) per area, # assigned area per node (sat/gate), link-graph/area-graph edge count
