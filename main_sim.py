@@ -15,11 +15,12 @@ N_NODES_PER_PLANE = 30
 GATEWAY_FILEPATH = "gateways.json"
 INITIAL_AREA_PLANE_WIDTH = 1                                  # 1, 2
 INITIAL_AREA_SATELLITE_CNT_PER_PLANE = 5                      # 3, 5, 6, 10
-INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 1  # 1:0, 3:1, 1:1, 1:3
+INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 3, 1  # 1:0, 3:1, 1:1
 
 USE_SAVED_TOPOLOGY_FILE = True
 SAVE_TOPOLOGY_AFTER_FINISH = False
 TOPOLOGY_FILEPATH = "saved_topology_{}_{}.pkl".format(INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO)
+LOG_OUTPUT_FILEPATH = "log_{}_{}.pkl".format(INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO)
 
 SIMULATION_TIME_STEP = 1                                      # in seconds
 SIMULATION_TIME_LENGTH = 60                                   # in seconds  # a full period = 6298
@@ -78,33 +79,80 @@ def run_simulation():
     print("# Total Satellites: {}".format(len(topology.SATELLITE_LIST)))
     print("# Total Gateways: {}".format(len(topology.GATEWAY_LIST)))
     print("Period: {}".format(topology.SATELLITE_LIST[0].plane.period))
+
+    log_output = {}
+    isl_link_cnt_over_time = []
+    isl_link_changes_over_time = []
+    stg_link_cnt_over_time = []
+    stg_link_changes_over_time = []
+    area_conn_cnt_over_time = []
+    area_conn_changes_over_time = []
+    intra_area_changes_over_time = []
+
     sim_time = 0
     while sim_time < SIMULATION_TIME_LENGTH:
         print("Time: {}".format(sim_time))
         topology.update_pos(sim_time)
-        isl_link_broken, isl_link_established, _, _ = topology.update_links()
-        _, _, = topology.update_area(isl_link_broken, isl_link_established)
+        isl_link_broken, isl_link_established, _, _, isl_link_stats, stg_link_stats = topology.update_links()
+        _, _, area_link_stats, intra_area_changes = topology.update_area(isl_link_broken, isl_link_established)
 
         # Observation period = ?
         # [0] Comparison:
         # [0.1] All satellites have an initial static area assignment (1:0)
-        # [0.2] Some satellites have an initial static area assignment, some are dynamically assigned (3:1, 1:1, 1:3)
+        # [0.2] Some satellites have an initial static area assignment, some are dynamically assigned (3:1, 1:1)
         # Evaluation:
         # [1] Stability
-        # [1.1] Averages: link count, link/area graph connectivity and diameter; distribution of node/area degrees TODO
+        # [1.1] Averages: link count, link/area graph connectivity and diameter; distribution of node/area degrees
         # [1.2] Averages: link/area topology change rate
-        # [2] Performance
+        # [2] Routing Efficiency
         # Traffic patterns:
-        # all satellites to nearest gateways (all-to-all, then pick nearest) TODO
-        # all satellites to all satellites TODO
-        # [2.1] distribution of #hops (nodes or areas) TODO
-        # [2.2] distribution of latency, compare with optimal (no area assignment, global optimal path) TODO
-        # Finally, record all data, dump to files, and plot figures TODO
+        # all satellites to nearest gateways (all-to-all, then pick nearest)
+        # all satellites to all satellites
+        # [2.1] distribution of #hops (nodes or areas)
+        # [2.2] distribution of latency, compare with optimal (no area assignment, global optimal path)
+        # Finally, record all data, dump to files, and plot figures
+        isl_link_cnt_over_time.append(isl_link_stats[2])
+        isl_link_changes_over_time.append(isl_link_stats[0] + isl_link_stats[1])
+        stg_link_cnt_over_time.append(stg_link_stats[2])
+        stg_link_changes_over_time.append(stg_link_stats[0] + stg_link_stats[1])
+        area_conn_cnt_over_time.append(area_link_stats[2])
+        area_conn_changes_over_time.append(area_link_stats[0] + area_link_stats[1])
+        intra_area_changes_over_time.append(intra_area_changes)
 
         sim_time += SIMULATION_TIME_STEP
-        if sim_time == SIMULATION_TIME_STEP:
+        if sim_time == SIMULATION_TIME_LENGTH:
             # Note that this could be very slow - we only run this at stable state
-            topology.compute_all_to_all_latency()
+            latency_mat, hop_cnt_mat, full_latency_mat, full_hop_cnt_mat = topology.compute_all_to_all_latency()
+            log_output["node_graph_diameter"] = np.max(full_hop_cnt_mat)
+            log_output["area_graph_diameter"] = int(np.max(topology.SHORTEST_AREA_PATH_DIST_MATRIX))
+            log_output["n_sat_per_area"] = np.sum(topology.NODE_AREA_ASSIGNMENT[:len(topology.SATELLITE_LIST), :],
+                                                  axis=0)
+            log_output["n_gate_per_area"] = np.sum(topology.NODE_AREA_ASSIGNMENT[len(topology.SATELLITE_LIST):, :],
+                                                   axis=0)
+            log_output["n_area_per_sat"] = np.sum(topology.NODE_AREA_ASSIGNMENT[:len(topology.SATELLITE_LIST), :],
+                                                  axis=1)
+            log_output["n_area_per_gate"] = np.sum(topology.NODE_AREA_ASSIGNMENT[len(topology.SATELLITE_LIST):, :],
+                                                   axis=1)
+            log_output["latency_mat"] = latency_mat
+            log_output["hop_cnt_mat"] = hop_cnt_mat
+            log_output["full_latency_mat"] = full_latency_mat
+            log_output["full_hop_cnt_mat"] = full_hop_cnt_mat
+
+    log_output["total_time"] = sim_time
+    log_output["n_sat"] = len(topology.SATELLITE_LIST)
+    log_output["n_gate"] = len(topology.GATEWAY_LIST)
+    log_output["n_node"] = len(topology.SATELLITE_LIST) + len(topology.GATEWAY_LIST)
+    log_output["n_area"] = topology.AREA_CONNECTIVITY_MATRIX.shape[0]
+    log_output["isl_link_cnt_over_time"] = isl_link_cnt_over_time
+    log_output["isl_link_changes_over_time"] = isl_link_changes_over_time
+    log_output["stg_link_cnt_over_time"] = stg_link_cnt_over_time
+    log_output["stg_link_changes_over_time"] = stg_link_changes_over_time
+    log_output["area_conn_cnt_over_time"] = area_conn_cnt_over_time
+    log_output["area_conn_changes_over_time"] = area_conn_changes_over_time
+    log_output["intra_area_changes_over_time"] = intra_area_changes_over_time
+
+    with open(LOG_OUTPUT_FILEPATH, "wb") as log_output_file:
+        pickle.dump(log_output, log_output_file)
 
     # Save links and area assignments to file
     if SAVE_TOPOLOGY_AFTER_FINISH:

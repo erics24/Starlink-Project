@@ -282,15 +282,13 @@ def update_links():
     stg_link_changes = (new_stg_links < np.inf).astype(np.int8) - (STG_LINK_MATRIX < np.inf).astype(np.int8)
     stg_link_broken = np.nonzero(stg_link_changes == -1)
     stg_link_established = np.nonzero(stg_link_changes == 1)
-    print("{} ISL links broken, {} ISL links established, {} in total".format(len(isl_link_broken[0]) // 2,
-                                                                              len(isl_link_established[0]) // 2,
-                                                                              np.sum(sat_degree_row) // 2))
-    print("{} STG links broken, {} STG links established, {} in total".format(len(stg_link_broken[0]),
-                                                                              len(stg_link_established[0]),
-                                                                              np.sum(stg_gate_degree)))
+    isl_link_stats = len(isl_link_broken[0]) // 2, len(isl_link_established[0]) // 2, np.sum(sat_degree_row) // 2
+    stg_link_stats = len(stg_link_broken[0]), len(stg_link_established[0]), np.sum(stg_gate_degree)
+    print("{} ISL links broken, {} ISL links established, {} in total".format(*isl_link_stats))
+    print("{} STG links broken, {} STG links established, {} in total".format(*stg_link_stats))
     ISL_LINK_MATRIX = new_isl_links
     STG_LINK_MATRIX = new_stg_links
-    return isl_link_broken, isl_link_established, stg_link_broken, stg_link_established
+    return isl_link_broken, isl_link_established, stg_link_broken, stg_link_established, isl_link_stats, stg_link_stats
 
 
 def get_node_area(node_id, node_area_assignment):
@@ -499,9 +497,9 @@ def update_area(isl_link_broken, isl_link_established):
     area_level_changes = new_area_connectivity_matrix - AREA_CONNECTIVITY_MATRIX
     area_links_disconnected = np.nonzero(area_level_changes < 0)
     area_links_connected = np.nonzero(area_level_changes > 0)
-    print("{} area-level link broken, {} area-level link established, {} links in total".format(
-        len(area_links_disconnected[0]) // 2, len(area_links_connected[0]) // 2,
-        np.sum(new_area_connectivity_matrix) // 2))
+    area_link_stats = (len(area_links_disconnected[0]) // 2, len(area_links_connected[0]) // 2,
+                       np.sum(new_area_connectivity_matrix) // 2)
+    print("{} area-level link broken, {} area-level link established, {} links in total".format(*area_link_stats))
     if np.sum(area_level_changes) > 0:
         # Assert the area graph is still fully connected
         area_graph = csr_matrix(new_area_connectivity_matrix)
@@ -531,7 +529,7 @@ def update_area(isl_link_broken, isl_link_established):
             area_shortest_node_path_predecessor_matrix)
         SHORTEST_NODE_PATH_PREDECESSOR_MATRIX_PER_AREA[area] = shortest_node_path_predecessor_matrix
     NODE_AREA_ASSIGNMENT = new_node_area_assignment
-    return area_with_node_removed, area_with_node_added
+    return area_with_node_removed, area_with_node_added, area_link_stats, len(area_changed)
 
 
 def run_intra_area_ospf(area, node_area_assignment):
@@ -582,7 +580,7 @@ def find_nearest_abr(src_node, src_area, dest_area, dist_matrix):
     assert NODE_AREA_ASSIGNMENT[src_node, src_area] == 1
     abr_candidates = np.nonzero(NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), src_area] *
                                 NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), dest_area] > 0)[0]
-    distances = dist_matrix[src_node, abr_candidates]
+    distances = dist_matrix[src_node, abr_candidates]  # TODO: Fix cases where distances is empty
     assert np.min(distances) > 0
     return abr_candidates[np.argmin(distances)], np.min(distances)
 
@@ -613,7 +611,7 @@ def compute_all_to_all_latency():
     # (excluding gateway nodes), pick an ABR with the shortest path locally, then move on to the next area
     # i.e. a gateway node is never used as an internal node in a path
     for src in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
-        print(src)
+        print(".", end="")
         for dest in range(len(SATELLITE_LIST) + len(GATEWAY_LIST)):
             src_area_candidates = get_node_area(src, NODE_AREA_ASSIGNMENT)
             dest_area_candidates = get_node_area(dest, NODE_AREA_ASSIGNMENT)
@@ -672,7 +670,3 @@ def compute_all_to_all_latency():
             full_link_hop_cnt_matrix[src, dest] = hop_cnt
 
     return all_to_all_latency_matrix, all_to_all_hop_cnt_matrix, full_latency_matrix, full_link_hop_cnt_matrix
-
-# TODO: Def a func to get some statistics here:
-#       # node (sat/gate) per area, # assigned area per node (sat/gate), link-graph/area-graph edge count
-#       # of area-level conn changes; intra-area routing table changes, and diameter of area graph (max area path len)
