@@ -2,19 +2,14 @@
 
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 from PyAstronomy import pyasl
 
-"""
-Constants
-"""
-EARTH_RADIUS = 6371000
-EARTH_ROTATION_AXIS = (0, 0, 1)
-STD_GRAVITATIONAL_PARAMETER_EARTH = 3.986004418e14
-SECONDS_PER_DAY = 86400
-EARTH_ROTATION_PER_SECONDS = 360. / SECONDS_PER_DAY
+from utils import *
 
 """
-Configurable Parameters
+Topology Configurations
 """
 GATEWAY_DEFAULT_ELEVATION = 25
 MAX_ISL_DISTANCE = 3000 * 1000
@@ -24,18 +19,20 @@ CONSTELLATION_LIST = []
 PLANE_LIST = []
 SATELLITE_LIST = []
 GATEWAY_LIST = []
-NODE_POSITION_MATRIX = None
-ISL_LINK_MATRIX = None
-STG_LINK_MATRIX = None
 
-SATELLITE_INITIAL_AREA = None  # elements are area ids, -1 means no assignment
-NODE_AREA_ASSIGNMENT = None  # #node by #area, 0 and 1 elements
-AREA_CONNECTIVITY_MATRIX = None  # #area by #area, 0 and 1 elements
-SHORTEST_AREA_PATH_DIST_MATRIX = None  # #area by #area, 0 means no paths
-SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = None  # same, elements are area ids, -9999 means no paths
+global NODE_POSITION_MATRIX  # #node by 3, (x, y, z)
+global ISL_LINK_MATRIX  # #sat by #sat, elements are distances, inf means no paths
+global STG_LINK_MATRIX  # #sat by #gate, elements are distances, inf means no paths
 
-SHORTEST_NODE_PATH_DIST_MATRIX = None  # #node by #node, 0 means no paths
-SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = None  # same, elements are sat ids or (gate ids + #sat), -9999 means no paths
+global SATELLITE_INITIAL_AREA  # elements are area ids, -1 means no assignment
+global NODE_AREA_ASSIGNMENT  # #node by #area, 0 and 1 elements
+
+global AREA_CONNECTIVITY_MATRIX  # #area by #area, 0 and 1 elements
+global SHORTEST_AREA_PATH_DIST_MATRIX  # #area by #area, 0 means no paths
+global SHORTEST_AREA_PATH_PREDECESSOR_MATRIX  # same, elements are area ids, -9999 means no paths
+
+global SHORTEST_NODE_PATH_DIST_MATRIX  # #node by #node, 0 means no paths
+global SHORTEST_NODE_PATH_PREDECESSOR_MATRIX  # same, elements are sat ids or (gate ids + #sat), -9999 means no paths
 
 
 class Constellation:
@@ -105,80 +102,80 @@ class Satellite:
 class Gateway:
     gate_id = 0
 
-    def __init__(self, latitude, longitude, altitude=GATEWAY_DEFAULT_ELEVATION, init_pos=None):
+    def __init__(self, latitude, longitude, altitude=GATEWAY_DEFAULT_ELEVATION):
         self.id = Gateway.gate_id
         Gateway.gate_id += 1
-        if init_pos is not None:
-            self.init_pos = init_pos.copy()
-        else:
-            self.init_pos = lat_lon_to_cartesian(latitude, longitude, altitude)
+        self.init_pos = lat_lon_to_cartesian(latitude, longitude, altitude)
         GATEWAY_LIST.append(self)
 
 
-def lat_lon_to_cartesian(latitude, longitude, altitude):
-    radius = EARTH_RADIUS + altitude
-    latitude = np.radians(latitude)
-    longitude = np.radians(longitude)
-    return np.array([radius * np.cos(latitude) * np.cos(longitude),
-                     radius * np.cos(latitude) * np.sin(longitude),
-                     radius * np.sin(latitude)],
-                    dtype=np.float32)
+def initialize_area(n_planes_per_area, n_nodes_per_plane_per_area, static_area_ratio, dynamic_area_ratio, random=False):
+    assert isinstance(static_area_ratio, int) and isinstance(dynamic_area_ratio, int)
+    assert static_area_ratio > 0
+    assert dynamic_area_ratio >= 0
+    global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
+    global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_DIST_MATRIX, SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    SATELLITE_INITIAL_AREA = np.full((len(SATELLITE_LIST)), -1, dtype=np.int32)
 
+    area_id = 0
+    assignment_counter = static_area_ratio
+    static_toggle = True
+    for cons in CONSTELLATION_LIST:
+        n_planes = len(cons.planes)
+        n_nodes_per_plane = cons.num_nodes_per_plane
+        assert n_planes % n_planes_per_area == 0
+        assert n_nodes_per_plane % n_nodes_per_plane_per_area == 0
+        # plane 0: sat 0-4 -> plane 1: sat 0-4 -> ...
+        cur_sat_ind = 0
+        while cur_sat_ind < n_nodes_per_plane:
+            cur_plane_ind = 0
+            while cur_plane_ind < n_planes:
+                for plane_ind in range(cur_plane_ind, cur_plane_ind + n_planes_per_area):
+                    assignment_counter -= 1
+                    if static_toggle:
+                        SATELLITE_INITIAL_AREA[
+                        cons.planes[plane_ind].satellites[cur_sat_ind].id:
+                        cons.planes[plane_ind].satellites[cur_sat_ind + n_nodes_per_plane_per_area - 1].id + 1
+                        ] = area_id
+                        area_id += 1
+                    if assignment_counter <= 0:
+                        if dynamic_area_ratio > 0:
+                            static_toggle = not static_toggle
+                            assignment_counter = static_area_ratio if static_toggle else dynamic_area_ratio
+                        else:
+                            assignment_counter = static_area_ratio
+                cur_plane_ind += n_planes_per_area
+            cur_sat_ind += n_nodes_per_plane_per_area
 
-def calculate_orbit_period(semi_major_axis):
-    return 2. * np.pi * np.sqrt(np.power(float(semi_major_axis), 3) / STD_GRAVITATIONAL_PARAMETER_EARTH)
-
-
-def gen_node_init_time_offset(n_planes, n_nodes_per_plane):
-    phase_offset_inc = 1. / n_nodes_per_plane / n_planes
-    phase_offsets = []
-    toggle = False
-    # Put offsets in this order [...8,6,4,2,0,1,3,5,7,9...]
-    # so that offsets in adjacent planes are close to each other
-    for i in range(n_planes):
-        if toggle:
-            phase_offsets.append(phase_offset_inc * i)
-        else:
-            phase_offsets.insert(0, phase_offset_inc * i)
-        toggle = not toggle
-    return phase_offsets
+    NODE_AREA_ASSIGNMENT = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST), area_id), dtype=np.int32)
+    static_satellite_ind = np.nonzero(SATELLITE_INITIAL_AREA >= 0)
+    NODE_AREA_ASSIGNMENT[static_satellite_ind, SATELLITE_INITIAL_AREA[static_satellite_ind]] = 1
+    AREA_CONNECTIVITY_MATRIX = np.zeros((area_id, area_id), dtype=np.int32)
+    SHORTEST_AREA_PATH_DIST_MATRIX = np.zeros((area_id, area_id), dtype=np.float32)
+    SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = np.full((area_id, area_id), -9999, dtype=np.int32)
+    SHORTEST_NODE_PATH_DIST_MATRIX = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST),
+                                               len(SATELLITE_LIST) + len(GATEWAY_LIST)), dtype=np.float32)
+    SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = np.full((len(SATELLITE_LIST) + len(GATEWAY_LIST),
+                                                     len(SATELLITE_LIST) + len(GATEWAY_LIST)), -9999, dtype=np.int32)
+    return area_id
 
 
 def update_pos(cur_time=0.):
     global NODE_POSITION_MATRIX
-    if NODE_POSITION_MATRIX is None:
-        NODE_POSITION_MATRIX = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST), 3), dtype=np.float32)
     # Update all satellite positions
     for satellite in SATELLITE_LIST:
         satellite_pos = satellite.plane.plane_solver.xyzPos(satellite.init_time_offset + cur_time)
         NODE_POSITION_MATRIX[satellite.id, :] = satellite_pos
     # Update all gateway positions
     rotation_degree = EARTH_ROTATION_PER_SECONDS * np.fmod(cur_time, SECONDS_PER_DAY)
-    rotation_matrix = get_rotation_matrix(rotation_degree)
+    rotation_matrix = get_earth_rotation_matrix(rotation_degree)
     for gate in GATEWAY_LIST:
         NODE_POSITION_MATRIX[gate.id + len(SATELLITE_LIST), :] = np.dot(rotation_matrix, gate.init_pos)
 
 
-def get_rotation_matrix(degree):
-    theta = np.radians(degree)
-    axis = np.asarray(EARTH_ROTATION_AXIS)
-    axis = axis / np.sqrt(np.dot(axis, axis))
-    a = np.cos(theta / 2.)
-    b, c, d = -axis * np.sin(theta / 2.)
-    aa, bb, cc, dd = a * a, b * b, c * c, d * d
-    bc, ad, ac, ab, bd, cd = b * c, a * d, a * c, a * b, b * d, c * d
-    return np.array([[aa + bb - cc - dd, 2 * (bc + ad), 2 * (bd - ac)],
-                     [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
-                     [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
-
-
 def update_links():
-    global ISL_LINK_MATRIX
-    if ISL_LINK_MATRIX is None:
-        ISL_LINK_MATRIX = np.full((len(SATELLITE_LIST), len(SATELLITE_LIST)), np.inf, dtype=np.float32)
-    global STG_LINK_MATRIX
-    if STG_LINK_MATRIX is None:
-        STG_LINK_MATRIX = np.full((len(SATELLITE_LIST), len(GATEWAY_LIST)), np.inf, dtype=np.float32)
+    global NODE_POSITION_MATRIX, ISL_LINK_MATRIX, STG_LINK_MATRIX
     new_links = squareform(pdist(NODE_POSITION_MATRIX).astype(np.float32))
 
     # Filter links within reachable distances
@@ -295,114 +292,244 @@ def update_links():
                                                                               np.sum(stg_gate_degree)))
     ISL_LINK_MATRIX = new_isl_links
     STG_LINK_MATRIX = new_stg_links
-    # TODO: Also return the diameter of the ISL graph (the whole graph should be that + 1)
+    # TODO: Also return link count, the diameter of the ISL graph (the whole graph should be that + 1)
     return isl_link_broken, isl_link_established, stg_link_broken, stg_link_established
 
 
-def initialize_area(n_planes_per_area, n_nodes_per_plane_per_area, static_area_ratio, dynamic_area_ratio, random=False):
-    assert isinstance(static_area_ratio, int) and isinstance(dynamic_area_ratio, int)
-    assert static_area_ratio > 0
-    assert static_area_ratio + 0.001 / (static_area_ratio + dynamic_area_ratio) >= 0.5
+def get_node_area(node_id):
+    global NODE_AREA_ASSIGNMENT
+    return np.nonzero(NODE_AREA_ASSIGNMENT[node_id, :] > 0)[0]
 
-    global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
-    global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
-    global SHORTEST_NODE_PATH_DIST_MATRIX, SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
-    SATELLITE_INITIAL_AREA = np.full((len(SATELLITE_LIST)), -1, dtype=np.int32)
 
-    area_id = 0
-    assignment_counter = static_area_ratio
-    static_toggle = True
-    for cons in CONSTELLATION_LIST:
-        n_planes = len(cons.planes)
-        n_nodes_per_plane = cons.num_nodes_per_plane
-        assert n_planes % n_planes_per_area == 0
-        assert n_nodes_per_plane % n_nodes_per_plane_per_area == 0
-        # plane 0: sat 0-4 -> plane 1: sat 0-4 -> ...
-        cur_sat_ind = 0
-        while cur_sat_ind < n_nodes_per_plane:
-            cur_plane_ind = 0
-            while cur_plane_ind < n_planes:
-                for plane_ind in range(cur_plane_ind, cur_plane_ind + n_planes_per_area):
-                    assignment_counter -= 1
-                    if static_toggle:
-                        SATELLITE_INITIAL_AREA[
-                            cons.planes[plane_ind].satellites[cur_sat_ind].id:
-                            cons.planes[plane_ind].satellites[cur_sat_ind + n_nodes_per_plane_per_area - 1].id + 1
-                        ] = area_id
-                        area_id += 1
-                    if assignment_counter <= 0:
-                        if dynamic_area_ratio > 0:
-                            static_toggle = not static_toggle
-                            assignment_counter = static_area_ratio if static_toggle else dynamic_area_ratio
-                        else:
-                            assignment_counter = static_area_ratio
-                cur_plane_ind += n_planes_per_area
-            cur_sat_ind += n_nodes_per_plane_per_area
-
-    NODE_AREA_ASSIGNMENT = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST), area_id), dtype=np.int32)
-    AREA_CONNECTIVITY_MATRIX = np.zeros((area_id, area_id), dtype=np.int32)
-    SHORTEST_AREA_PATH_DIST_MATRIX = np.zeros((area_id, area_id), dtype=np.float32)
-    SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = np.full((area_id, area_id), -9999, dtype=np.int32)
-    SHORTEST_NODE_PATH_DIST_MATRIX = np.zeros((len(SATELLITE_LIST) + len(GATEWAY_LIST),
-                                               len(SATELLITE_LIST) + len(GATEWAY_LIST)), dtype=np.float32)
-    SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = np.full((len(SATELLITE_LIST) + len(GATEWAY_LIST),
-                                                     len(SATELLITE_LIST) + len(GATEWAY_LIST)), -9999, dtype=np.int32)
-    return area_id
+def get_sat_neighbors(sat_id):
+    global ISL_LINK_MATRIX
+    return np.nonzero(ISL_LINK_MATRIX[sat_id, :] < np.inf)[0]
 
 
 def update_area(isl_link_broken, isl_link_established, stg_link_broken, stg_link_established):
-    # TODO:
-    # If AREA_CONNECTIVITY_MATRIX does not exist, create numpy array
+    global ISL_LINK_MATRIX, STG_LINK_MATRIX
+    global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
+    global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_DIST_MATRIX, SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
 
-    # Deal with broken ISL first: check if each end node's last area assignments still hold
+    # Remove duplicate undirected links
+    isl_broken = np.asarray([isl_link_broken[0][isl_link_broken[0] < isl_link_broken[1]],
+                             isl_link_broken[1][isl_link_broken[0] < isl_link_broken[1]]]).T
+    isl_established = np.asarray([isl_link_established[0][isl_link_established[0] < isl_link_established[1]],
+                                  isl_link_established[1][isl_link_established[0] < isl_link_established[1]]]).T
+    area_with_nodes_added = set()
+    area_with_nodes_removed = set()
+
+    # Deal with broken ISL links first: check if each end node's last area assignments still hold
     # 1. If the end node has a static area assignment, keep using it
     # 2. If the end node has other area assignments, search for its neighbor nodes which:
-    #    have the same area assignment but static, or did not have ISL link changes in the last timestep
+    #    have the same area assignment but static, or did not have ISL link broken in the last timestep
     #    if found, the end node can also keep those area assignments
     # 3. If both 1 and 2 do not satisfy, treat all the node's links as newly established and re-initialize its area
-    # 4. If the end node loses an area assignment, this effect can propagate to its neighbors whose areas are
-    #    dynamically assigned, so there is no guarantee that an area is still fully connected without iterative checking
-
-    # Deal with broken STG link:
-    # Check the area assignment of the gateway node, delete or re-assign areas accordingly
+    isl_broken_sat = np.unique(isl_broken.flatten())
+    for broken_pairs in isl_broken:
+        for end_node in broken_pairs:
+            end_node_area_prev = get_node_area(end_node)
+            neighbors = get_sat_neighbors(end_node)
+            neighbors_without_broken_links = np.setdiff1d(neighbors, isl_broken_sat)
+            keep_prev_area = False
+            for prev_area in end_node_area_prev:
+                if (prev_area == SATELLITE_INITIAL_AREA[end_node] or
+                        prev_area in [SATELLITE_INITIAL_AREA[neighbor] for neighbor in neighbors] or
+                        prev_area in sum([list(get_node_area(neighbor)) for neighbor in neighbors_without_broken_links],
+                                         [])):
+                    keep_prev_area = True
+                else:
+                    NODE_AREA_ASSIGNMENT[end_node, prev_area] = 0
+                    area_with_nodes_removed.add(prev_area)
+                    # Note: If the end node loses an area assignment, this effect may propagate to its neighbors
+                    # whose areas are dynamically assigned, so there is no guarantee that an area is still fully
+                    # connected without iterative checking
+            if not keep_prev_area:
+                print("Warning: Removed all prev area for sat {}".format(end_node))
+                for neighbor in neighbors:
+                    isl_established = np.append(isl_established, [[end_node, neighbor]], axis=0)
 
     # Deal with newly established ISL links:
     # 1. If both link have the same static area assignment, nothing happens
-    # 2. Decide whether to add an area to an end node based on the choice of ABRs
-    #    [1] The node with the greatest number of neighbor nodes (plus itself) that have different static area
+    # 2. If both link have area assignments, decide which node is an ABR:
+    #    [1] The node with the most neighbor nodes (plus itself) that have different static area
     #    assignments will be an ABR;
-    #    [2] The node with the greatest number of neighbor nodes (plus itself) with static area assignment will
+    #    [2] The node with the most neighbor nodes (plus itself) with static area assignment will
     #    be an ABR;
     #    [3] The node with more links will be an ABR;
-    #    [4] Lastly, break ties using satellite ids (preferring smaller)
+    #    [4] Lastly, break ties using satellite ids (prefer smaller)
     # 3. Do nothing to the non-ABR node; For the ABR node, add an area assignment to it:
     #    [1] If the non-ABR node has a static area assignment, pick that and add it to the ABR node;
-    #    [2] Otherwise, pick an area from the non-ABR node so that the greatest number of the non-ABR node's neighbor
-    #        also have that same area assignment
+    #    [2] Otherwise, pick an area from the non-ABR node so that the most non-ABR node's neighbors
+    #        also have that same area assignment as their [i] static/dynamic area, or [ii] static area,
+    #        or [iii] break ties using area ids (prefer smaller)
     # 4. If one end node does not have an area assignment, instead of setting the other end node as an ABR, assign an
     #    area to this node by picking an area from the other node in the same way as 3
-    # 5. If both nodes have no area assignment, they will not belong to any area at this timestep without iterative
-    #    assignment from their neighbors; This should not happen very often at the stable state, and can
-    #    be avoided during initialization by aligning static/dynamic-area satellites interleaved
+    # 5. If both nodes have no area assignment, mark them as unsolved, and loop again to solve them at the end
+    #    This should not happen often during the stable state, and could be largely avoided during initialization
+    #    by aligning static/dynamic-area satellites interleaved
+    while isl_established.size > 0:
+        new_isl_unresolved = np.empty((0, 2), dtype=np.int64)
+        for established_pairs in isl_established:
+            if (SATELLITE_INITIAL_AREA[established_pairs[0]] == SATELLITE_INITIAL_AREA[established_pairs[1]] and
+                    SATELLITE_INITIAL_AREA[established_pairs[0]] >= 0):
+                continue
+            node_0_prev_area = get_node_area(established_pairs[0])
+            node_1_prev_area = get_node_area(established_pairs[1])
+            if node_0_prev_area.size == 0 and node_1_prev_area.size == 0:
+                print("Warning: Unresolved links between no-area nodes {} and {}".format(established_pairs[0],
+                                                                                         established_pairs[1]))
+                new_isl_unresolved = np.append(new_isl_unresolved,
+                                               [[established_pairs[0], established_pairs[1]]], axis=0)
+                continue
+            if node_0_prev_area.size == 0:
+                abr, non_abr = established_pairs[0], established_pairs[1]
+            elif node_1_prev_area.size == 0:
+                abr, non_abr = established_pairs[1], established_pairs[0]
+            else:
+                node_0_neighbors = get_sat_neighbors(established_pairs[0])
+                node_1_neighbors = get_sat_neighbors(established_pairs[1])
+                node_0_neighbors_static_areas = [SATELLITE_INITIAL_AREA[neighbor] for neighbor
+                                                 in list(node_0_neighbors) + [established_pairs[0]]
+                                                 if SATELLITE_INITIAL_AREA[neighbor] != -1]
+                node_1_neighbors_static_areas = [SATELLITE_INITIAL_AREA[neighbor] for neighbor
+                                                 in list(node_1_neighbors) + [established_pairs[1]]
+                                                 if SATELLITE_INITIAL_AREA[neighbor] != -1]
+                node_0_neighbors_unique_static_areas = len(set(node_0_neighbors_static_areas))
+                node_1_neighbors_unique_static_areas = len(set(node_1_neighbors_static_areas))
+                if node_0_neighbors_unique_static_areas > node_1_neighbors_unique_static_areas:
+                    abr, non_abr = established_pairs[0], established_pairs[1]
+                elif node_0_neighbors_unique_static_areas < node_1_neighbors_unique_static_areas:
+                    abr, non_abr = established_pairs[1], established_pairs[0]
+                else:
+                    if len(node_0_neighbors_static_areas) > len(node_1_neighbors_static_areas):
+                        abr, non_abr = established_pairs[0], established_pairs[1]
+                    elif len(node_0_neighbors_static_areas) < len(node_1_neighbors_static_areas):
+                        abr, non_abr = established_pairs[1], established_pairs[0]
+                    else:
+                        if len(node_0_neighbors) > len(node_1_neighbors):
+                            abr, non_abr = established_pairs[0], established_pairs[1]
+                        elif len(node_0_neighbors) < len(node_1_neighbors):
+                            abr, non_abr = established_pairs[1], established_pairs[0]
+                        else:
+                            # Break ties
+                            sorted_nodes = sorted([established_pairs[0], established_pairs[1]])
+                            abr, non_abr = sorted_nodes[0], sorted_nodes[1]
+            abr_prev_area = get_node_area(abr)
+            if SATELLITE_INITIAL_AREA[non_abr] >= 0:
+                area_to_add = SATELLITE_INITIAL_AREA[non_abr]
+            else:
+                non_abr_prev_area = get_node_area(non_abr)
+                non_abr_neighbors = get_sat_neighbors(non_abr)
+                non_abr_neighbors_areas = sum([list(get_node_area(neighbor)) for neighbor in non_abr_neighbors], [])
+                non_abr_neighbors_area_counter = np.asarray([non_abr_neighbors_areas.count(prev_area)
+                                                             for prev_area in non_abr_prev_area])
+                non_abr_prev_area_selected = non_abr_prev_area[non_abr_neighbors_area_counter ==
+                                                               np.max(non_abr_neighbors_area_counter)]
+                if non_abr_prev_area_selected.size == 1:
+                    area_to_add = non_abr_prev_area_selected[0]
+                else:
+                    non_abr_neighbors_static_areas = [SATELLITE_INITIAL_AREA[neighbor] for neighbor in non_abr_neighbors
+                                                      if SATELLITE_INITIAL_AREA[neighbor] != -1]
+                    non_abr_neighbors_area_counter = np.asarray([non_abr_neighbors_static_areas.count(prev_area)
+                                                                 for prev_area in non_abr_prev_area_selected])
+                    non_abr_prev_area_selected = non_abr_prev_area_selected[non_abr_neighbors_area_counter ==
+                                                                            np.max(non_abr_neighbors_area_counter)]
+                    if non_abr_prev_area_selected.size == 1:
+                        area_to_add = non_abr_prev_area_selected[0]
+                    else:
+                        # Break ties
+                        area_to_add = np.min(non_abr_prev_area_selected)
 
-    # Deal with newly established ISL links:
+            if area_to_add not in abr_prev_area:
+                NODE_AREA_ASSIGNMENT[abr, area_to_add] = 1
+                area_with_nodes_added.add(area_to_add)
+
+        # Check if each area is fully connected
+        # If not, only keep the connected component of that area which contains nodes statically assigned to it
+        # Remove this area assignment from other nodes previously in this area
+        for area_id in range(NODE_AREA_ASSIGNMENT.shape[1]):
+            area_sat_list = np.nonzero(NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), area_id] > 0)[0]
+            area_isl_link_matrix = ISL_LINK_MATRIX[np.ix_(area_sat_list, area_sat_list)]
+            area_isl_link_matrix[area_isl_link_matrix == np.inf] = 0
+            area_graph = csr_matrix(area_isl_link_matrix)
+            n_comp, labels = connected_components(csgraph=area_graph, directed=False, return_labels=True)
+            if n_comp > 1:
+                static_area_sat = np.argmax(SATELLITE_INITIAL_AREA == area_id)
+                static_area_label = labels[np.argmax(area_sat_list == static_area_sat)]
+                nodes_to_remove_area = area_sat_list[labels != static_area_label]
+                for node_to_remove in nodes_to_remove_area:
+                    NODE_AREA_ASSIGNMENT[node_to_remove, area_id] = 0
+                    area_with_nodes_removed.add(area_id)
+
+        # Double check that each node belongs to an area
+        # If not, add links of those no-area nodes to new_isl_unresolved
+        no_area_nodes = np.nonzero(np.sum(NODE_AREA_ASSIGNMENT[:len(SATELLITE_LIST), :], axis=1) == 0)[0]
+        for no_area_node in no_area_nodes:
+            for neighbor in get_sat_neighbors(no_area_node):
+                no_area_pair = sorted([no_area_node, neighbor])
+                new_isl_unresolved = np.append(new_isl_unresolved,
+                                               [[no_area_pair[0], no_area_pair[1]]], axis=0)
+        # Remove duplicate undirected links
+        new_isl_unresolved = np.unique(new_isl_unresolved, axis=0)
+
+        # Repeat the process above if there are unresolved links
+        if np.array_equal(isl_established, new_isl_unresolved):
+            print("Warning: Unable to resolve area assignments for the following links:\n{}".format(isl_established))
+            break
+        isl_established = new_isl_unresolved
+
+    return update_fixed_area(stg_link_broken, stg_link_established)
+
+
+def update_fixed_area(stg_link_broken, stg_link_established):
+    global ISL_LINK_MATRIX, STG_LINK_MATRIX
+    global SATELLITE_INITIAL_AREA, NODE_AREA_ASSIGNMENT, AREA_CONNECTIVITY_MATRIX
+    global SHORTEST_AREA_PATH_DIST_MATRIX, SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    global SHORTEST_NODE_PATH_DIST_MATRIX, SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    # Deal with broken STG links:
+    # Check the area assignment of the gateway node, delete or re-assign areas accordingly
+    # TODO
+
+    # Deal with newly established STG links:
     # Check the area assignment of the gateway node, add areas accordingly in the same way as 3 above
+    # A gateway is like an ABR in the way that it always belongs to all possible areas of its neighbor satellite
+    # while area propagation won't pass across it
+    # TODO
 
-    # Record the modified areas during above updates
-    # Run OSPF (Dijkstra) within each updated area
-    # Update SHORTEST_NODE_PATH_DIST_MATRIX and SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+    # Update area-level connectivity
+    # Only if there is a change compared to the last one:
+    #   TODO: Assert the area graph is still fully connected
+    #   Calculate area-level shortest path:
+    #   Run Dijkstra to update SHORTEST_AREA_PATH_DIST_MATRIX and SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
 
-    # Based on the current NODE_AREA_ASSIGNMENT, calculate AREA_CONNECTIVITY_MATRIX
-    # If there is a change, run Dijkstra to update SHORTEST_AREA_PATH_DIST_MATRIX and
-    # SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    # Run OSPF (Dijkstra) within each updated area;
+    # Compare with previous routing table in SHORTEST_NODE_PATH_PREDECESSOR_MATRIX;
+    # Then update SHORTEST_NODE_PATH_DIST_MATRIX and SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
 
-    # Return # of area changes and diameter of the area graph
+    # Record the areas with changes in SHORTEST_NODE_PATH_PREDECESSOR_MATRIX
+
+    # Get some statistics here: # node per area, # assigned area per node,
+    # # of area-level changes; areas with internal routing table changes and diameter of the area graph
+    # return these
     pass
 
 
-def compute_route():
-    # Note: We never use a gateway as ABR when calculating routes -
-    # only compare satellite ABRs and find the closest one locally
+def compute_node_to_node_latency():
+    # Note: Run this only at stable state
 
-    # TODO: Special baseline case: No areas, ideal route
+    # define src nodes
+    # define dest nodes
+    # create matrix storing all latencies
+    # for each pair of src -> dest, compute route and distance (latency) and fill in the matrix
+    # also store the hop count to
+
+    # Cross-area routing:
+    # First find the area-level path using SHORTEST_AREA_PATH_PREDECESSOR_MATRIX
+    # Then, within each area along the path, search for ABRs that connect two areas from NODE_AREA_ASSIGNMENT
+    # (including gateway nodes), pick an ABR with the shortest path locally, then move on to the next area
+
+    # TODO: Special baseline case: No areas, ideal route; directly run dijkstra from ISL_LINK_MATRIX (could be slow...)
+    # return latency matrix
     pass

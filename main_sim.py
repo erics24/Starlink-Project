@@ -5,10 +5,10 @@ import numpy as np
 import topology
 
 """
-Configurable Parameters
+Simulation Configurations
 """
 USE_SAVED_TOPOLOGY_FILE = True
-SAVE_TOPOLOGY_AFTER_FINISH = False
+SAVE_TOPOLOGY_AFTER_FINISH = True
 TOPOLOGY_FILEPATH = "saved_topology.pkl"
 
 # Use following setup if not loading from saved topology file
@@ -17,18 +17,17 @@ INCLINATIONS = [30, 50, 70, -30, -50, -70]
 N_PLANES = 10
 N_NODES_PER_PLANE = 30
 GATEWAY_FILEPATH = "gateways.json"
-INITIAL_AREA_PLANE_WIDTH = 1  # 1, 2
-INITIAL_AREA_SATELLITE_CNT_PER_PLANE = 5   # 3, 5, 6, 10
-INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 0  # 1:0, 3:1, 1:1
+INITIAL_AREA_PLANE_WIDTH = 1                                  # 1, 2
+INITIAL_AREA_SATELLITE_CNT_PER_PLANE = 5                      # 3, 5, 6, 10
+INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 1  # 1:0, 3:1, 1:1
 
-SIMULATION_TIME_STEP = 1  # in seconds
-SIMULATION_TIME_LENGTH = 10  # in seconds  # a full period = 6298
+SIMULATION_TIME_STEP = 1                                      # in seconds
+SIMULATION_TIME_LENGTH = 6298                                 # in seconds  # a full period = 6298
 
 
 def initialize(topology_file=None):
     global SATELLITE_ALTITUDE, INCLINATIONS, N_PLANES, N_NODES_PER_PLANE, GATEWAY_FILEPATH
     if topology_file is not None:
-        # Only load links and area assignments, initialize node positions from scratch at time 0
         with open(topology_file, "rb") as topology_in_file:
             saved_topology = pickle.load(topology_in_file)
         SATELLITE_ALTITUDE = saved_topology["satellite_altitude"]
@@ -36,8 +35,6 @@ def initialize(topology_file=None):
         N_PLANES = saved_topology["n_planes"]
         N_NODES_PER_PLANE = saved_topology["n_nodes_per_plane"]
         GATEWAY_FILEPATH = saved_topology["gateway_filepath"]
-        topology.ISL_LINK_MATRIX = saved_topology["isl_link_matrix"]
-        topology.STG_LINK_MATRIX = saved_topology["stg_link_matrix"]
 
     # Add constellations, planes, and satellites
     for ci, incl in enumerate(INCLINATIONS):
@@ -50,13 +47,22 @@ def initialize(topology_file=None):
         gateway_data = json.load(gateway_file)
         for gateway in gateway_data:
             topology.Gateway(latitude=gateway['lat'], longitude=gateway['lng'], altitude=gateway['minElevation'])
-
+    # Initialize node positions from scratch at time 0
+    topology.NODE_POSITION_MATRIX = np.zeros((len(topology.SATELLITE_LIST) + len(topology.GATEWAY_LIST), 3),
+                                             dtype=np.float32)
+    # Initialize links and areas
     if topology_file is None:
+        topology.ISL_LINK_MATRIX = np.full((len(topology.SATELLITE_LIST), len(topology.SATELLITE_LIST)),
+                                           np.inf, dtype=np.float32)
+        topology.STG_LINK_MATRIX = np.full((len(topology.SATELLITE_LIST), len(topology.GATEWAY_LIST)),
+                                           np.inf, dtype=np.float32)
         n_areas = topology.initialize_area(n_planes_per_area=INITIAL_AREA_PLANE_WIDTH,
                                            n_nodes_per_plane_per_area=INITIAL_AREA_SATELLITE_CNT_PER_PLANE,
                                            static_area_ratio=INITIAL_AREA_STATIC_RATIO,
                                            dynamic_area_ratio=INITIAL_AREA_DYNAMIC_RATIO)
     else:
+        topology.ISL_LINK_MATRIX = saved_topology["isl_link_matrix"]
+        topology.STG_LINK_MATRIX = saved_topology["stg_link_matrix"]
         topology.SATELLITE_INITIAL_AREA = saved_topology["sat_init_area"]
         topology.NODE_AREA_ASSIGNMENT = saved_topology["node_area_matrix"]
         topology.AREA_CONNECTIVITY_MATRIX = saved_topology["area_matrix"]
@@ -77,32 +83,32 @@ def run_simulation():
     while sim_time < SIMULATION_TIME_LENGTH:
         print("Time: {}".format(sim_time))
         topology.update_pos(sim_time)
-        print("#{}\t{}".format(topology.SATELLITE_LIST[0].id,
-                               topology.NODE_POSITION_MATRIX[topology.SATELLITE_LIST[0].id, :]))
         isl_link_broken, isl_link_established, stg_link_broken, stg_link_established = topology.update_links()
+        # TODO: Compare update_area vs update_fixed_area (could only be used when loading saved topology)
+        #       (only do the second half of update_area, where ISLs won't change; only gateway changes;
+        #       AREA_CONNECTIVITY_MATRIX and area-level shortest path won't change;
+        #       still need to run dijkstra inside each area to get SHORTEST_NODE_PATH_DIST_MATRIX and
+        #       SHORTEST_NODE_PATH_PREDECESSOR_MATRIX)
         topology.update_area(isl_link_broken, isl_link_established, stg_link_broken, stg_link_established)
 
-        # print(topology.ISL_LINK_MATRIX)
-        # print(topology.STG_LINK_MATRIX)
-        # The closest satellite to each gateway
-        # print(np.argmin(topology.STG_LINK_MATRIX, axis=0)[0:165])
-        # print(np.min(topology.STG_LINK_MATRIX, axis=0)[0:165])
-        sim_time += SIMULATION_TIME_STEP
-
-        # TODO:
-        # Traffic patterns:
-        # one (US-East/West) gateway to all satellites (above land, i.e. close to a gateway but maybe outside of range)
-        # all satellites (above land) to nearest gateway
-        # all satellites (above land) to all satellites (above land)
-        # all satellites to all satellites
         # Observation period = ?
-        # Metrics: distribution of latency, distribution of # hops (nodes or areas), distribution of node/area degrees
-        # area/link changing rate
+        # [0] Comparison:
+        # [0.1] Baseline: fixed area assignment, do not update satellite area assignment during the run TODO
+        # [0.2] All satellites have an initial static area assignment
+        # [0.3] Some satellites have an initial static area assignment, some are dynamically assigned
+        # Evaluation:
+        # [1] Stability
+        # [1.1] Averages: link count, link/area graph connectivity and diameter; distribution of node/area degrees TODO
+        # [1.2] Averages: link/area topology change rate
+        # [2] Performance
+        # Traffic patterns:
+        # all satellites to nearest gateways (all-to-all, then pick nearest) TODO
+        # all satellites to all satellites TODO
+        # [2.1] distribution of #hops (nodes or areas) TODO
+        # [2.2] distribution of latency, compare with optimal (no area assignment, global optimal path) TODO
+        # Finally, record all data, dump to files, and plot figures TODO
 
-    # TODO:
-    # Calculate average #links at stable state
-    # Measure link change rate at stable state
-    # Measure area change rate at stable state
+        sim_time += SIMULATION_TIME_STEP
 
     # Save links and area assignments to file
     if SAVE_TOPOLOGY_AFTER_FINISH:
