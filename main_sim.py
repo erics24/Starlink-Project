@@ -7,10 +7,6 @@ import topology
 """
 Simulation Configurations
 """
-USE_SAVED_TOPOLOGY_FILE = True
-SAVE_TOPOLOGY_AFTER_FINISH = True
-TOPOLOGY_FILEPATH = "saved_topology.pkl"
-
 # Use following setup if not loading from saved topology file
 SATELLITE_ALTITUDE = 1000 * 1000
 INCLINATIONS = [30, 50, 70, -30, -50, -70]
@@ -19,10 +15,14 @@ N_NODES_PER_PLANE = 30
 GATEWAY_FILEPATH = "gateways.json"
 INITIAL_AREA_PLANE_WIDTH = 1                                  # 1, 2
 INITIAL_AREA_SATELLITE_CNT_PER_PLANE = 5                      # 3, 5, 6, 10
-INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 1  # 1:0, 3:1, 1:1
+INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO = 1, 1  # 1:0, 3:1, 1:1, 1:3
+
+USE_SAVED_TOPOLOGY_FILE = True
+SAVE_TOPOLOGY_AFTER_FINISH = False
+TOPOLOGY_FILEPATH = "saved_topology_{}_{}.pkl".format(INITIAL_AREA_STATIC_RATIO, INITIAL_AREA_DYNAMIC_RATIO)
 
 SIMULATION_TIME_STEP = 1                                      # in seconds
-SIMULATION_TIME_LENGTH = 6298                                 # in seconds  # a full period = 6298
+SIMULATION_TIME_LENGTH = 600                                  # in seconds  # a full period = 6298
 
 
 def initialize(topology_file=None):
@@ -49,13 +49,13 @@ def initialize(topology_file=None):
             topology.Gateway(latitude=gateway['lat'], longitude=gateway['lng'], altitude=gateway['minElevation'])
     # Initialize node positions from scratch at time 0
     topology.NODE_POSITION_MATRIX = np.zeros((len(topology.SATELLITE_LIST) + len(topology.GATEWAY_LIST), 3),
-                                             dtype=np.float32)
+                                             dtype=np.float64)
     # Initialize links and areas
     if topology_file is None:
         topology.ISL_LINK_MATRIX = np.full((len(topology.SATELLITE_LIST), len(topology.SATELLITE_LIST)),
-                                           np.inf, dtype=np.float32)
+                                           np.inf, dtype=np.float64)
         topology.STG_LINK_MATRIX = np.full((len(topology.SATELLITE_LIST), len(topology.GATEWAY_LIST)),
-                                           np.inf, dtype=np.float32)
+                                           np.inf, dtype=np.float64)
         n_areas = topology.initialize_area(n_planes_per_area=INITIAL_AREA_PLANE_WIDTH,
                                            n_nodes_per_plane_per_area=INITIAL_AREA_SATELLITE_CNT_PER_PLANE,
                                            static_area_ratio=INITIAL_AREA_STATIC_RATIO,
@@ -68,7 +68,6 @@ def initialize(topology_file=None):
         topology.AREA_CONNECTIVITY_MATRIX = saved_topology["area_matrix"]
         topology.SHORTEST_AREA_PATH_DIST_MATRIX = saved_topology["spf_area_dist_matrix"]
         topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX = saved_topology["spf_area_path_matrix"]
-        topology.SHORTEST_NODE_PATH_DIST_MATRIX = saved_topology["spf_node_dist_matrix"]
         topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX = saved_topology["spf_node_path_matrix"]
         n_areas = topology.AREA_CONNECTIVITY_MATRIX.shape[0]
     print("# Total Areas: {}".format(n_areas))
@@ -83,19 +82,13 @@ def run_simulation():
     while sim_time < SIMULATION_TIME_LENGTH:
         print("Time: {}".format(sim_time))
         topology.update_pos(sim_time)
-        isl_link_broken, isl_link_established, stg_link_broken, stg_link_established = topology.update_links()
-        # TODO: Compare update_area vs update_fixed_area (could only be used when loading saved topology)
-        #       (only do the second half of update_area, where ISLs won't change; only gateway changes;
-        #       AREA_CONNECTIVITY_MATRIX and area-level shortest path won't change;
-        #       still need to run dijkstra inside each area to get SHORTEST_NODE_PATH_DIST_MATRIX and
-        #       SHORTEST_NODE_PATH_PREDECESSOR_MATRIX)
-        topology.update_area(isl_link_broken, isl_link_established, stg_link_broken, stg_link_established)
+        isl_link_broken, isl_link_established, _, _ = topology.update_links()
+        _, _, = topology.update_area(isl_link_broken, isl_link_established)
 
         # Observation period = ?
         # [0] Comparison:
-        # [0.1] Baseline: fixed area assignment, do not update satellite area assignment during the run TODO
-        # [0.2] All satellites have an initial static area assignment
-        # [0.3] Some satellites have an initial static area assignment, some are dynamically assigned
+        # [0.1] All satellites have an initial static area assignment (1:0)
+        # [0.2] Some satellites have an initial static area assignment, some are dynamically assigned (3:1, 1:1, 1:3)
         # Evaluation:
         # [1] Stability
         # [1.1] Averages: link count, link/area graph connectivity and diameter; distribution of node/area degrees TODO
@@ -124,7 +117,6 @@ def run_simulation():
                          "area_matrix": topology.AREA_CONNECTIVITY_MATRIX,
                          "spf_area_dist_matrix": topology.SHORTEST_AREA_PATH_DIST_MATRIX,
                          "spf_area_path_matrix": topology.SHORTEST_AREA_PATH_PREDECESSOR_MATRIX,
-                         "spf_node_dist_matrix": topology.SHORTEST_NODE_PATH_DIST_MATRIX,
                          "spf_node_path_matrix": topology.SHORTEST_NODE_PATH_PREDECESSOR_MATRIX}
         with open(TOPOLOGY_FILEPATH, "wb") as topology_out_file:
             pickle.dump(topology_dict, topology_out_file)

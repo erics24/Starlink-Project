@@ -8,6 +8,7 @@ EARTH_ROTATION_AXIS = (0, 0, 1)
 STD_GRAVITATIONAL_PARAMETER_EARTH = 3.986004418e14
 SECONDS_PER_DAY = 86400
 EARTH_ROTATION_PER_SECONDS = 360. / SECONDS_PER_DAY
+SPEED_OF_LIGHT = 299792458
 
 
 def lat_lon_to_cartesian(latitude, longitude, altitude):
@@ -17,7 +18,7 @@ def lat_lon_to_cartesian(latitude, longitude, altitude):
     return np.array([radius * np.cos(latitude) * np.cos(longitude),
                      radius * np.cos(latitude) * np.sin(longitude),
                      radius * np.sin(latitude)],
-                    dtype=np.float32)
+                    dtype=np.float64)
 
 
 def calculate_orbit_period(semi_major_axis):
